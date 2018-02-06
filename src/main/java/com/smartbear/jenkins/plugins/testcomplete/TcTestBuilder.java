@@ -23,16 +23,19 @@
  */
 
 package com.smartbear.jenkins.plugins.testcomplete;
+
 import hudson.*;
 import hudson.model.*;
+import hudson.remoting.VirtualChannel;
+import hudson.tasks.BuildStepDescriptor;
 import hudson.tasks.BuildStepMonitor;
+import hudson.tasks.Builder;
 import hudson.tasks.junit.TestResult;
 import hudson.tasks.junit.TestResultAction;
 import hudson.util.ArgumentListBuilder;
 import hudson.util.FormValidation;
-import hudson.tasks.Builder;
-import hudson.tasks.BuildStepDescriptor;
 import hudson.util.ListBoxModel;
+import jenkins.security.MasterToSlaveCallable;
 import net.sf.json.JSONObject;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
@@ -410,8 +413,7 @@ public class TcTestBuilder extends Builder implements Serializable {
             } else {
                 try {
                     args = prepareServiceCommandLine(listener, chosenInstallation, args, env);
-                }
-                catch (Exception e) {
+                } catch (Exception e) {
                     TcLog.error(listener, Messages.TcTestBuilder_ExceptionOccurred(), e.toString());
                     TcLog.info(listener, Messages.TcTestBuilder_MarkingBuildAsFailed());
                     build.setResult(Result.FAILURE);
@@ -431,6 +433,7 @@ public class TcTestBuilder extends Builder implements Serializable {
         boolean result = false;
 
         Proc process = null;
+        long startTime = Utils.getSystemTime(launcher.getChannel(), listener);
         try {
             TcLog.info(listener, Messages.TcTestBuilder_LaunchingTestRunner());
 
@@ -443,10 +446,10 @@ public class TcTestBuilder extends Builder implements Serializable {
                 }
             }
 
-            long startTime = Utils.getSystemTime(launcher.getChannel(), listener);
-
-            Launcher.ProcStarter processStarter = launcher.launch().cmds(args).envs(build.getEnvironment(listener));
-
+            Launcher.ProcStarter processStarter = launcher.launch()
+                    .cmds(args)
+                    .envs(build.getEnvironment(listener))
+                    .killWhenInterrupted(false);
             process = processStarter.start();
 
             if (realTimeout == -1) {
@@ -466,7 +469,7 @@ public class TcTestBuilder extends Builder implements Serializable {
                 TcLog.debug(listener, Messages.TcTestBuilder_Debug_FixedExitCodeMessage(), exitCode, fixedExitCode);
             }
 
-            processFiles(build, listener, workspace, tcReportAction, startTime);
+            processFiles(build, listener, workspace, tcReportAction, startTime, false);
 
             if (fixedExitCode == 0) {
                 result = true;
@@ -493,7 +496,12 @@ public class TcTestBuilder extends Builder implements Serializable {
                 }
             }
         } catch (InterruptedException e) {
-            // The build has been aborted. Let Jenkins mark it as ABORTED
+            //The build was aborted, either by an user or by Jenkins (timeout)
+            //Let's attempt to stop TC normally in order to have test results
+            TcLog.info(listener, "Build was interrupted. Trying to stop TestComplete/TestExecute ...");
+            stopTcNormally(launcher, listener);
+            processFiles(build, listener, workspace, tcReportAction, startTime, true);
+            // Let Jenkins mark the build as ABORTED
             throw e;
         } catch (Exception e) {
             TcLog.error(listener, Messages.TcTestBuilder_ExceptionOccurred(),
@@ -523,6 +531,49 @@ public class TcTestBuilder extends Builder implements Serializable {
 
         TcLog.info(listener, Messages.TcTestBuilder_TestExecutionFinishedMessage(), testDisplayName);
         return true;
+    }
+
+    private void stopTcNormally(Launcher launcher, BuildListener listener) {
+        try {
+            String remoteBinaryPath = copyStopTcBinary(launcher.getChannel());
+            execStopTcBinary(launcher, listener, remoteBinaryPath);
+        } catch (Exception e) {
+            TcLog.warning(listener, "Exception when trying to stop TestComplete TestExecute: " + e.getMessage());
+        }
+    }
+
+    private String copyStopTcBinary(VirtualChannel channel) throws IOException, InterruptedException {
+        InputStream stopTestCompleteBinary = getClass().getClassLoader().getResourceAsStream("com/smartbear/jenkins/plugins/testcomplete/binary/StopTestComplete.exe");
+        String pathOnSlave = getRemoteTempDir(channel) + "StopTestComplete.exe";
+        FilePath remoteFilePath = new FilePath(channel, pathOnSlave);
+        remoteFilePath.copyFrom(stopTestCompleteBinary);
+        return pathOnSlave;
+    }
+
+    private String getRemoteTempDir(VirtualChannel channel) throws IOException, InterruptedException {
+        return channel.call(new MasterToSlaveCallable<String, IOException>() {
+            @Override
+            public String call() throws IOException {
+                return System.getProperty("java.io.tmpdir");
+            }
+        });
+    }
+
+    private void execStopTcBinary(Launcher launcher, BuildListener listener, String remoteBinaryPath) throws IOException, InterruptedException {
+        Launcher.ProcStarter processStarter = launcher.launch().cmds(remoteBinaryPath);
+        Proc process = processStarter.start();
+        int exitCode = process.joinWithTimeout(1, TimeUnit.MINUTES, listener);
+        switch (exitCode) {
+            case 0:
+                TcLog.info(listener, "TestComplete/TestExecute was stopped.");
+                break;
+            case 1:
+                TcLog.warning(listener, "Cannot stop TestComplete/TestExecute since it is not executing any tests.");
+                break;
+            default:
+                TcLog.error(listener, "Error initiating the stop of TestComplete/TestExecute.");
+                break;
+        }
     }
 
     private TestResultAction getTestResultAction(AbstractBuild<?, ?> build) {
@@ -589,7 +640,7 @@ public class TcTestBuilder extends Builder implements Serializable {
         }
     }
 
-    private ArgumentListBuilder prepareServiceCommandLine(BuildListener listener, TcInstallation chosenInstallation, ArgumentListBuilder baseArgs, EnvVars env) throws Exception{
+    private ArgumentListBuilder prepareServiceCommandLine(BuildListener listener, TcInstallation chosenInstallation, ArgumentListBuilder baseArgs, EnvVars env) throws Exception {
         ArgumentListBuilder resultArgs = new ArgumentListBuilder();
 
         resultArgs.addQuoted(chosenInstallation.getServicePath());
@@ -653,7 +704,7 @@ public class TcTestBuilder extends Builder implements Serializable {
         return resultArgs;
     }
 
-    private void processFiles(AbstractBuild build, BuildListener listener, Workspace workspace, TcReportAction testResult, long startTime)
+    private void processFiles(AbstractBuild build, BuildListener listener, Workspace workspace, TcReportAction testResult, long startTime, boolean interrupted)
             throws IOException, InterruptedException {
 
         // reading error file
@@ -663,6 +714,9 @@ public class TcTestBuilder extends Builder implements Serializable {
             if (workspace.getSlaveErrorFilePath().exists()) {
                 br = new BufferedReader(new InputStreamReader(workspace.getSlaveErrorFilePath().read(), Charset.forName(Constants.DEFAULT_CHARSET_NAME)));
                 String errorString = br.readLine().trim();
+                if (interrupted && errorString.equals("Unexpected error occurred")) {
+                    errorString = "Build was interrupted.";
+                }
                 TcLog.warning(listener, Messages.TcTestBuilder_ErrorMessage(), errorString);
                 testResult.setError(errorString);
             }
@@ -689,8 +743,7 @@ public class TcTestBuilder extends Builder implements Serializable {
             } finally {
                 workspace.getSlaveLogXFilePath().delete();
             }
-        }
-        else {
+        } else {
             TcLog.warning(listener, Messages.TcTestBuilder_UnableToFindLogFile(),
                     workspace.getSlaveLogXFilePath().getName());
 
@@ -892,7 +945,7 @@ public class TcTestBuilder extends Builder implements Serializable {
 
     @Override
     public DescriptorImpl getDescriptor() {
-        return (DescriptorImpl)super.getDescriptor();
+        return (DescriptorImpl) super.getDescriptor();
     }
 
     @Extension
